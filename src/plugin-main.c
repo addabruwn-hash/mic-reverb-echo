@@ -65,6 +65,7 @@ struct reverb_echo {
 	size_t channels;
 	uint32_t sample_rate;
 	struct channel_state ch[MAX_AUDIO_CHANNELS];
+	uint64_t next_ts;
 
 	/* параметры (пишутся из UI-потока, читаются из аудио-потока) */
 	float reverb_mix;
@@ -121,6 +122,31 @@ static void free_state(struct reverb_echo *f)
 	}
 }
 
+static void clear_state(struct reverb_echo *f)
+{
+	for (size_t c = 0; c < f->channels; c++) {
+		struct channel_state *st = &f->ch[c];
+		for (int i = 0; i < NUM_COMBS; i++) {
+			memset(st->combs[i].buf, 0, sizeof(float) * (size_t)st->combs[i].size);
+			st->combs[i].store = 0.0f;
+		}
+		for (int i = 0; i < NUM_ALLPASS; i++)
+			memset(st->aps[i].buf, 0, sizeof(float) * (size_t)st->aps[i].size);
+		memset(st->echo_buf, 0, sizeof(float) * (size_t)st->echo_size);
+	}
+}
+
+/* Горячая клавиша: включить/выключить фильтр (как глазок в окне фильтров). */
+static void re_toggle_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+	struct reverb_echo *f = data;
+	if (!pressed)
+		return;
+	obs_source_set_enabled(f->context, !obs_source_enabled(f->context));
+}
+
 static const char *re_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -168,6 +194,9 @@ static void *re_create(obs_data_t *settings, obs_source_t *source)
 
 	alloc_state(f);
 	re_update(f, settings);
+
+	obs_hotkey_register_source(source, "mic_reverb_echo.toggle",
+				   obs_module_text("ToggleHotkey"), re_toggle_hotkey, f);
 	return f;
 }
 
@@ -215,6 +244,11 @@ static struct obs_audio_data *re_filter_audio(void *data, struct obs_audio_data 
 {
 	struct reverb_echo *f = data;
 	const size_t frames = audio->frames;
+
+	/* После паузы (фильтр был выключен) очищаем хвосты, чтобы не звучал старый звук. */
+	if (f->next_ts == 0 || audio->timestamp > f->next_ts + 50000000ULL)
+		clear_state(f);
+	f->next_ts = audio->timestamp + (uint64_t)frames * 1000000000ULL / f->sample_rate;
 
 	for (size_t c = 0; c < f->channels; c++) {
 		float *x = (float *)audio->data[c];
